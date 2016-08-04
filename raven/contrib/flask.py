@@ -32,7 +32,53 @@ from raven.utils.compat import _urlparse
 from raven.utils.encoding import to_unicode
 from raven.utils.imports import import_string
 from raven.utils.wsgi import get_headers, get_environ
+from raven.utils import once
 
+
+def patch_run_simple():
+    from werkzeug import serving
+    import urllib2
+    import os
+    original_run_simple = serving.run_simple
+
+    @once
+    def demo_run_simple(*args, **kwargs):
+        protocol = 'http://'
+        if kwargs.get('ssl_context'):
+            protocol = 'https://'
+        dev_url = protocol + args[0] + ':' + str(args[1])
+        with open(os.path.expanduser('~') + '/.sentry_install_id') as f:
+            sentry_install_id = f.read().strip()
+            urllib2.urlopen('http://dev.getsentry.net:8000/configure_complete/' + sentry_install_id + '/?dev_url=' + dev_url)
+        original_run_simple(*args, **kwargs)
+
+    serving.run_simple = demo_run_simple
+
+
+USER_FEEDBACK_SCRIPT = """
+<html>
+<head>
+<script src="https://cdn.ravenjs.com/2.3.0/raven.min.js"></script>
+</head>
+<body>
+<script>
+Raven.setUserContext({name: '%(name)s', email: '%(email)s'});
+Raven.showReportDialog({
+    eventId: '%(event_id)s',
+    dsn: '%(public_dsn)s',
+});
+
+var redirect_to_sentry = function() {
+    window.location.replace('https://app.getsentry.com/demo/flask/?query=%(event_id)s');
+}
+
+window.document.body.onclick = function() {
+    window.setTimeout(redirect_to_sentry, 10000);
+}
+</script>
+</body>
+</html>
+"""
 
 def make_client(client_cls, app, dsn=None):
     # TODO(dcramer): django and Flask share very similar concepts here, and
@@ -104,7 +150,7 @@ class Sentry(object):
     # gets shared by every app that does init on it
     def __init__(self, app=None, client=None, client_cls=Client, dsn=None,
                  logging=False, logging_exclusions=None, level=logging.NOTSET,
-                 wrap_wsgi=None, register_signal=True):
+                 wrap_wsgi=None, register_signal=True, demo=False):
         if client and not isinstance(client, Client):
             raise TypeError('client should an instance of Client')
 
@@ -116,8 +162,30 @@ class Sentry(object):
         self.level = level
         self.wrap_wsgi = wrap_wsgi
         self.register_signal = register_signal
+        self.demo = demo
 
         if app:
+            if self.demo:
+                patch_run_simple()
+
+                @app.route('/sentry-demo-error')
+                def demo_error():
+                    try:
+                        a = 1
+                        b = 0
+                        return "the answer to life the universe and everything is %d" % (a / b)
+                    except:
+                        self.client.release = '0.0.1'
+                        self.client.environment = 'staging'
+                        sentry_event_id = self.client.captureException()
+                        context = {
+                            'event_id': sentry_event_id,
+                            'public_dsn': self.client.get_public_dsn('https'),
+                            'name': 'Eric Feng',
+                            'email': 'eric@getsentry.com',
+                        }
+                        return USER_FEEDBACK_SCRIPT % context
+
             self.init_app(app)
 
     @property
